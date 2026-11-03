@@ -6,8 +6,13 @@ Steps:
                        step can choose its target.
 2. Aggregate weekly  - weeks run Monday to Sunday; partial weeks at the start and
                        end of the data are dropped (they would look like a sales drop).
-3. Select products   - enough history to learn from, then the top N by volume.
-4. Fill the grid     - one row per product per week from its first sale to the end,
+3. Trading days      - days per week with any sale at all, across all products. The shop
+                       closes around Christmas and on bank holidays; that is known in
+                       advance, so it is a legitimate feature for the future too.
+4. Select products   - using ONLY the weeks before the test window, so the choice of
+                       products does not peek at the period we will evaluate on:
+                       enough history, still selling recently, then the top N by volume.
+5. Fill the grid     - one row per product per week from its first sale to the end,
                        with 0 for weeks without sales (no row is not the same as no data).
 """
 
@@ -25,16 +30,10 @@ WEEKLY_PATH = Path("data/processed/weekly.parquet")
 class WeeklyConfig:
     bulk_factor: float = 20.0  # a line is bulk if quantity > factor x the item's median line...
     bulk_min_quantity: int = 500  # ...and also above this absolute floor
-    min_history_weeks: int = 52  # product must be on sale at least this long before the end
+    test_weeks: int = 12  # the final weeks held out for evaluation; selection never sees them
+    min_history_weeks: int = 52  # on sale at least this long before the test window
+    recent_weeks: int = 12  # at least one sale in this many weeks before the test window
     top_n: int = 500
-
-
-def flag_bulk(sales: pd.DataFrame, cfg: WeeklyConfig) -> pd.Series:
-    """True for lines far above the item's typical line quantity."""
-    median_line = sales.groupby("stock_code")["quantity"].transform("median")
-    return (sales["quantity"] > cfg.bulk_factor * median_line) & (
-        sales["quantity"] >= cfg.bulk_min_quantity
-    )
 
 
 def week_start(dates: pd.Series) -> pd.Series:
@@ -58,6 +57,33 @@ def complete_weeks(dates: pd.Series) -> tuple[pd.Timestamp, pd.Timestamp]:
     return first, last
 
 
+def first_test_week(last_week: pd.Timestamp, cfg: WeeklyConfig) -> pd.Timestamp:
+    """Monday of the first test week."""
+    return last_week - pd.Timedelta(weeks=cfg.test_weeks - 1)
+
+
+def flag_bulk(sales: pd.DataFrame, cfg: WeeklyConfig, before: pd.Timestamp | None = None) -> pd.Series:
+    """True for lines far above the item's typical line quantity.
+
+    The typical line (median) is learned from lines before `before` when given,
+    so the threshold does not depend on the test period.
+    """
+    learn = sales if before is None else sales[sales["invoice_date"] < before]
+    median_line = learn.groupby("stock_code")["quantity"].median()
+    # products first sold in the test period: fall back to all their lines
+    median_line = median_line.reindex(sales["stock_code"].unique()).fillna(
+        sales.groupby("stock_code")["quantity"].median()
+    )
+    threshold = sales["stock_code"].map(median_line) * cfg.bulk_factor
+    return (sales["quantity"] > threshold) & (sales["quantity"] >= cfg.bulk_min_quantity)
+
+
+def trading_days(sales: pd.DataFrame) -> pd.Series:
+    """Days with at least one sale, per week, across all products."""
+    days = sales["invoice_date"].dt.normalize()
+    return days.groupby(week_start(sales["invoice_date"])).nunique().rename("trading_days")
+
+
 def aggregate(sales: pd.DataFrame, bulk: pd.Series) -> pd.DataFrame:
     """One row per (product, week) that had sales."""
     df = sales.assign(
@@ -76,13 +102,18 @@ def aggregate(sales: pd.DataFrame, bulk: pd.Series) -> pd.DataFrame:
     return weekly.drop(columns="revenue").reset_index()
 
 
-def select_products(weekly: pd.DataFrame, last_week: pd.Timestamp, cfg: WeeklyConfig) -> pd.Index:
-    """Products with enough history, ranked by volume excluding bulk orders."""
-    first_sale = weekly.groupby("stock_code")["week"].min()
-    long_enough = first_sale[first_sale <= last_week - pd.Timedelta(weeks=cfg.min_history_weeks - 1)].index
+def select_products(weekly: pd.DataFrame, cutoff: pd.Timestamp, cfg: WeeklyConfig) -> pd.Index:
+    """Products chosen from the weeks before `cutoff` (the first test week) only."""
+    seen = weekly[weekly["week"] < cutoff]
+    first_sale = seen.groupby("stock_code")["week"].min()
+    last_sale = seen.groupby("stock_code")["week"].max()
+
+    long_enough = first_sale <= cutoff - pd.Timedelta(weeks=cfg.min_history_weeks)
+    still_selling = last_sale >= cutoff - pd.Timedelta(weeks=cfg.recent_weeks)
+    eligible = long_enough[long_enough & still_selling].index
 
     volume = (
-        weekly[weekly["stock_code"].isin(long_enough)]
+        seen[seen["stock_code"].isin(eligible)]
         .assign(base=lambda d: d["quantity"] - d["bulk_quantity"])
         .groupby("stock_code")["base"]
         .sum()
@@ -106,18 +137,28 @@ def fill_grid(weekly: pd.DataFrame, last_week: pd.Timestamp) -> pd.DataFrame:
 
 def build_weekly(sales: pd.DataFrame, cfg: WeeklyConfig | None = None) -> tuple[pd.DataFrame, dict]:
     cfg = cfg or WeeklyConfig()
-    bulk = flag_bulk(sales, cfg)
     first, last = complete_weeks(sales["invoice_date"])
+    cutoff = first_test_week(last, cfg)
+    bulk = flag_bulk(sales, cfg, before=cutoff)
 
     weekly = aggregate(sales, bulk)
     weekly = weekly[(weekly["week"] >= first) & (weekly["week"] <= last)]
-    products = select_products(weekly, last, cfg)
+    products = select_products(weekly, cutoff, cfg)
     selected = fill_grid(weekly[weekly["stock_code"].isin(products)], last)
 
+    days = trading_days(sales)
+    selected = selected.merge(days, left_on="week", right_index=True, how="left")
+    selected["trading_days"] = selected["trading_days"].fillna(0).astype("int64")  # shop closed
+
+    all_weeks = pd.date_range(first, last, freq="W-MON")
+    days = days.reindex(all_weeks, fill_value=0)
     in_range = (sales["invoice_date"] >= first) & (sales["invoice_date"] < last + pd.Timedelta(weeks=1))
     total_units = sales.loc[in_range, "quantity"].sum()
     report = {
-        "weeks": f"{first.date()} to {last.date()} ({(last - first).days // 7 + 1} weeks)",
+        "weeks": f"{first.date()} to {last.date()} ({len(all_weeks)} weeks)",
+        "test window": f"{cutoff.date()} to {last.date()} ({cfg.test_weeks} weeks)",
+        "weeks with no sales at all": ", ".join(str(d.date()) for d in days[days == 0].index) or "none",
+        "trading days per week": days.value_counts().sort_index().to_dict(),
         "bulk lines": int(bulk.sum()),
         "bulk share of units": f"{sales.loc[bulk, 'quantity'].sum() / sales['quantity'].sum():.2%}",
         "products in data": int(sales["stock_code"].nunique()),
